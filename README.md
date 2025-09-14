@@ -36,10 +36,13 @@ CNC mills, or other PCB prototyping tools.
 
 ## 📂 Project Layout
 
+
+```
 docker-flatcam/
 ├── Dockerfile # Builds FlatCAM + Xfce + XRDP
 ├── Makefile # Easy commands to build and run
 └── README.md # This file
+```
 
 
 ---
