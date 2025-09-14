@@ -1,0 +1,205 @@
+# FlatCAM (Beta) for WSLg — GUI via X11 (default) or Wayland (opt-in), no RDP
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    VISPY_BACKEND=pyqt5 \
+    QT_QPA_PLATFORM=xcb   
+
+# ---------- System dependencies ----------
+RUN apt-get update && apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
+      # Python base
+      python3 python3-pip python3-venv python3-scipy python3-tk \
+      git wget unzip ca-certificates xauth \
+      # GL / EGL / Wayland / X11
+      libgl1 libegl1 mesa-utils \
+      libwayland-client0 libwayland-cursor0 libwayland-egl1 \
+      # X11 + XCB stack for Qt xcb platform plugin
+      libx11-6 libxext6 libxrender1 libxrandr2 libxi6 libsm6 libice6 \
+      libxcomposite1 \
+      libxcb1 libxcb-render0 libxcb-shape0 libxcb-xfixes0 \
+      libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+      libxcb-util1 libxcb-glx0 libxkbcommon0 libxkbcommon-x11-0 \
+      # GLib (fixes: libgthread-2.0.so.0)
+      libglib2.0-0 libdbus-1-3 libpcre2-8-0 \
+      # Fonts
+      libfontconfig1 libfreetype6 fonts-dejavu-core \
+      # Geometry/GIS libs for shapely/rtree/rasterio
+      libgeos-dev libspatialindex-dev gdal-bin libgdal-dev \
+      # Qt Wayland plugin (optional; we default to X11 but keep Wayland available)
+      qtwayland5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Defensive: check GLib runtime exists
+RUN test -f /usr/lib/x86_64-linux-gnu/libgthread-2.0.so.0
+
+# ---------- Fetch FlatCAM (Beta) ----------
+RUN mkdir -p /opt/flatcam
+WORKDIR /opt/flatcam
+RUN git clone --depth 1 -b Beta https://bitbucket.org/jpcgt/flatcam.git src || \
+    git clone --depth 1 https://bitbucket.org/jpcgt/flatcam.git src
+WORKDIR /opt/flatcam/src
+
+# ---------- Python virtualenv + pinned deps (block NumPy 2.x) ----------
+RUN python3 -m venv /opt/flatcam/src/.venv && \
+    . /opt/flatcam/src/.venv/bin/activate && \
+    python -m pip install --upgrade pip wheel setuptools && \
+    printf "numpy==1.23.5\n" > /tmp/constraints.txt && \
+    pip install -c /tmp/constraints.txt "numpy==1.23.5" && \
+    pip install -c /tmp/constraints.txt \
+      PyQt5==5.15.10 \
+      vispy==0.6.6 \
+      PyOpenGL>=3.1.6 PyOpenGL_accelerate>=3.1.6 \
+      pillow \
+      "matplotlib==3.8.*" && \
+    pip install -c /tmp/constraints.txt \
+      shapely>=2.0 rtree ezdxf \
+      svgpathtools svg.path \
+      rasterio lxml reportlab svglib \
+      ortools pyserial qrcode[pil] simplejson descartes dill && \
+    ( [ -f requirements.txt ] && pip install -c /tmp/constraints.txt -r requirements.txt || true ) && \
+    python - <<'PY'
+import numpy, vispy, ctypes
+print("NUMPY=", numpy.__version__, "VISPY=", vispy.__version__)
+assert numpy.__version__.startswith("1.23."), "NumPy pin failed"
+assert vispy.__version__=="0.6.6", "VisPy pin failed"
+ctypes.CDLL("libgthread-2.0.so.0")
+PY
+
+# --- Qt file-dialog shim: force any initial directory to /work ---
+RUN mkdir -p /opt/flatcam/src/.venv/lib/python3.10/site-packages && \
+    cat > /opt/flatcam/src/.venv/lib/python3.10/site-packages/sitecustomize.py << 'PY'
+import os, sys
+
+WORK = os.environ.get("FLATCAM_DEFAULT_DIR", "/work")
+APP_PATH = os.environ.get("FLATCAM_APP_PATH", "/opt/flatcam/src")
+
+def _fix(dirpath: object) -> str:
+    try:
+        s = "" if dirpath is None else str(dirpath)
+    except Exception:
+        s = ""
+    if not s or s.startswith(APP_PATH):
+        return WORK
+    return s
+
+# One-time debug so we know this file was actually loaded
+if not getattr(sys, "_flatcam_sitecustomize_logged", False):
+    sys._flatcam_sitecustomize_logged = True
+    print(f"[sitecustomize] forcing QFileDialog directories to {WORK} (APP_PATH={APP_PATH})",
+          file=sys.stderr)
+
+try:
+    from PyQt5.QtWidgets import QFileDialog
+    from PyQt5.QtCore import QUrl
+
+    # 1) Patch constructor
+    _orig_init = QFileDialog.__init__
+    def _patched_init(self, *a, **k):
+        if len(a) >= 3:
+            a = list(a); a[2] = _fix(a[2]); a = tuple(a)
+        elif 'directory' in k:
+            k['directory'] = _fix(k.get('directory'))
+        return _orig_init(self, *a, **k)
+    QFileDialog.__init__ = _patched_init
+
+    # 2) Patch instance methods used to change dir afterward
+    _orig_set_dir = QFileDialog.setDirectory
+    def _patched_set_dir(self, directory):
+        return _orig_set_dir(self, _fix(directory))
+    QFileDialog.setDirectory = _patched_set_dir
+
+    _orig_set_dir_url = QFileDialog.setDirectoryUrl
+    def _patched_set_dir_url(self, url):
+        try:
+            if isinstance(url, QUrl):
+                path = url.toLocalFile()
+                if not path or path.startswith(APP_PATH):
+                    url = QUrl.fromLocalFile(WORK)
+        except Exception:
+            pass
+        return _orig_set_dir_url(self, url)
+    QFileDialog.setDirectoryUrl = _patched_set_dir_url
+
+    # 3) Patch static helpers
+    _go  = QFileDialog.getOpenFileName
+    _gos = QFileDialog.getOpenFileNames
+    _gs  = QFileDialog.getSaveFileName
+    _gd  = QFileDialog.getExistingDirectory
+
+    def getOpenFileName(*a, **k):
+        if len(a) >= 3:
+            a = list(a); a[2] = _fix(a[2]); a = tuple(a)
+        else:
+            k['directory'] = _fix(k.get('directory'))
+        return _go(*a, **k)
+
+    def getOpenFileNames(*a, **k):
+        if len(a) >= 3:
+            a = list(a); a[2] = _fix(a[2]); a = tuple(a)
+        else:
+            k['directory'] = _fix(k.get('directory'))
+        return _gos(*a, **k)
+
+    def getSaveFileName(*a, **k):
+        if len(a) >= 3:
+            a = list(a); a[2] = _fix(a[2]); a = tuple(a)
+        else:
+            k['directory'] = _fix(k.get('directory'))
+        return _gs(*a, **k)
+
+    def getExistingDirectory(*a, **k):
+        if len(a) >= 2:
+            a = list(a); a[1] = _fix(a[1]); a = tuple(a)
+        else:
+            k['directory'] = _fix(k.get('directory'))
+        return _gd(*a, **k)
+
+    QFileDialog.getOpenFileName      = getOpenFileName
+    QFileDialog.getOpenFileNames     = getOpenFileNames
+    QFileDialog.getSaveFileName      = getSaveFileName
+    QFileDialog.getExistingDirectory = getExistingDirectory
+
+except Exception:
+    # Never block startup if PyQt isn't importable yet.
+    pass
+PY
+
+
+# --- Launcher (final) ---
+RUN mkdir -p /work && \
+    cat > /usr/local/bin/flatcam <<'EOF'
+#!/usr/bin/env bash
+set -e
+
+# Treat /work as "home"
+export HOME=/work
+export XDG_CONFIG_HOME=/work/.config
+export XDG_CACHE_HOME=/work/.cache
+export XDG_DATA_HOME=/work/.local/share
+
+# Tell our shim where to redirect from/to
+export FLATCAM_DEFAULT_DIR=/work
+export FLATCAM_APP_PATH=/opt/flatcam/src
+
+# Make sure Python can see sitecustomize in the venv
+export PYTHONPATH=/opt/flatcam/src/.venv/lib/python3.10/site-packages${PYTHONPATH:+:$PYTHONPATH}
+
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" /work/.FlatCAM
+cd /work
+
+# Activate venv and launch FlatCAM
+source /opt/flatcam/src/.venv/bin/activate
+exec python /opt/flatcam/src/FlatCAM.py
+EOF
+RUN chmod +x /usr/local/bin/flatcam
+
+# Workspace mount point
+RUN mkdir -p /work
+WORKDIR /work
+
+CMD ["/usr/local/bin/flatcam"]
+
