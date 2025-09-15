@@ -136,5 +136,10 @@ FlatCAM by Juan Pablo Caram
 
 Docker-based setup by C. W. Wright https://github.com/lidar532
 
+## References
+[CNC Milling Double Sidede PCB.  Step by Step using a CNC.](https://www.youtube.com/watch?v=9xczeQMj2dg)
+
+[Carvera Air CNC, Double Sided PCB Milling.](https://www.youtube.com/watch?v=EiicIzQ-ReA)
+
 
 
